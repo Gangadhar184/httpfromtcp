@@ -1,113 +1,219 @@
 package org.example;
 
 import java.io.FileInputStream;
-import java.io.IOException;
+import java.io.InputStream;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
-/**
- *  your program will now read messages.txt 8 bytes at a time
- *  and print that data back to stdout in 8 byte chunks.
- */
 public class Main {
-    public static void main(String[] args) throws IOException {
-        //open the file txt for reading
-        //FileInputStream so we can read bytes from a file.
-        try(FileInputStream fs = new FileInputStream("message.txt")) {
-            //creating a byte array for capacity of 8 bytes[?,?,?,?,?,?,?,?]
-            byte[] buffer = new byte[8];
 
-            //holds the line currently being built
-            // Example:
-            // Read #1 -> "Hello Wo"
-            // currentLine = "Hello Wo"
-            //
-            // Read #2 -> "rld\nJava"
-            // currentLine helps us reconstruct:
-            // "Hello World"
-            String currentLine = "";
+    // Special marker used to signal that the producer thread
+    // has finished reading the file.
+    // Java BlockingQueues cannot.
+    //
+    //  we place a special  value into
+    // the queue to tell consumers that no more data is coming.
+    private static final String EOF_MARKER = "__EOF__";
 
-            //keep reading until end of file
-            while(true) {
-                //read up to 8 bytes form the file into buffer,
-                //eg: if txt file contains "helloworld"
-                //first read: buffer = [h,e,l,l,o,w,o,r] bytreads = 8
-                //second read: buffer = [l,d,o,w,o,r,...], byteread = 2
-                // only first 2bytes are new data
-                int byteReads = fs.read(buffer);
-                if(byteReads == -1){
-                    break; //if its -1 we are end of file
-                }
-                //convert only the bytes that were actually read into string,
-                // Parameters:
-                // buffer      -> source byte array
-                // 0           -> start at index 0
-                // bytesRead   -> number of valid bytes
-                //
-                // Why not:
-                // new String(buffer)
-                //
-                // Because the last read might not fill the buffer.
-                //
-                // Example:
-                // buffer size = 8
-                //
-                // Previous read:
-                // "abcdefgh"
-                //
-                // Last read:
-                // only "xy"
-                //
-                // buffer becomes:
-                // [x, y, c, d, e, f, g, h]
-                //
-                // new String(buffer)
-                // -> "xycdefgh" (WRONG)
-                //
-                // new String(buffer, 0, 2)
-                // -> "xy" (CORRECT)
-                String chunk = new String(buffer,0, byteReads);
+    public static void main(String[] args) throws Exception {
 
-                /**
-                 * split the chunk wherever a newline occurs
-                 * eg chunk = "rld\nJava"
-                 * parts = ["rld","Java"]
-                 * the -1 tells java: keep trailing empty strings too
-                 * eg: "abc\n" wihthout -1 : ["abc"] with -1: ["abc", ""]
-                 * this is imp because it lets us detect lines that end exactly at a new line
-                 */
-                String[] parts = chunk.split("\n", -1);
-                /**
-                 * process every part except the last one. why?
-                 * every part before the last is guaranteed to end at a new line, meanint it forms complete line
-                 * eg:parts = ["rld","Java"]
-                 * "rld" complets the line. "java" may continue int the next chunk
-                 */
-                for(int i = 0; i < parts.length - 1; i++) {
-                    //pring the complete line, currentline contain data from previous red
-                    //eg: currL = "Hello Wo" parts[i ] = "rld", output: Hello World
-                    System.out.printf("read: %s%n", currentLine + parts[i]);
-                    currentLine = "";
-                }
-                /**
-                 * last part may be incomplete,
-                 * save it so future reads can continue building the line
-                 * eg: ["rld", "java"]
-                 * after princint "Hello World":
-                 * currentLine += "java"
-                 */
-                currentLine += parts[parts.length - 1];
+        // Open the file.
+        //
+        // Notice that we DO NOT use try-with-resources here.
+        //
+        // Why?
+        //
+        // The worker thread will continue reading from this file
+        // after getLinesChannel() returns.
+        //
+        // If we closed it here, the worker thread would fail.
+        InputStream file = new FileInputStream("message.txt");
+
+        // Start the worker thread and receive the queue.
+        //
+        // Think of this exactly like:
+        //
+        // Java:
+        // queue = getLinesChannel(file)
+        BlockingQueue<String> lines = getLinesChannel(file);
+
+        // Consume lines as they arrive.
+        //
+        // We keep pulling items from the queue until we
+        // receive the EOF marker.
+        while (true) {
+
+            // take() blocks (waits) if the queue is empty.
+            // This is similar to receiving from a Go channel.
+            String line = lines.take();
+
+            // Producer thread signals completion by sending
+            // the EOF marker.
+            if (EOF_MARKER.equals(line)) {
+                break;
             }
-            /**
-             * after eof there might still be data left
-             * eg:
-             * File:
-             * Hello
-             * world
-             * if the file does not end with a new line, "world" wuold still be sitting in currentline
-             * we must printit
-             */
-            if(!currentLine.isEmpty()) {
-                System.out.printf("read: %s%n", currentLine);
-            }
+            System.out.printf("read: %s%n", line);
         }
+    }
+
+    /**
+     * Responsibilities:
+     * - Read file in 8-byte chunks
+     * - Reconstruct complete lines
+     * - Send lines to a queue
+     * - Close file when finished
+     * - Signal completion
+     */
+    public static BlockingQueue<String> getLinesChannel(
+            InputStream stream
+    ) {
+
+        // Create the queue.
+        //
+        // Think of this as our channel.
+        //
+        // Producer thread writes to it.
+        // Consumer thread reads from it.
+        BlockingQueue<String> channel =
+                new LinkedBlockingQueue<>();
+
+        // Create worker thread.
+        Thread worker = new Thread(() -> {
+
+            // try-with-resources ensures the file is closed
+            // when the worker is completely finished.
+            try (InputStream in = stream) {
+
+                // Buffer used for reading.
+                // Size = 8 bytes because that's what the
+                // assignment requires.
+                byte[] buffer = new byte[8];
+
+                // Holds a line that may span multiple reads.
+                // Example:
+                // Read #1:
+                // "Hello Wo"
+                // currentLine = "Hello Wo"
+                //
+                // Read #2:
+                // "rld\nJava"
+                // currentLine helps us reconstruct:
+                //
+                // "Hello World"
+                String currentLine = "";
+
+                // Continue reading until EOF.
+                while (true) {
+
+                    // Read up to 8 bytes into buffer.
+                    // Returns:
+                    // 8  -> full buffer
+                    // <8 -> partial read
+                    // -1 -> EOF
+                    int bytesRead = in.read(buffer);
+
+                    // End of file.
+                    if (bytesRead == -1) {
+                        break;
+                    }
+
+                    // Convert ONLY valid bytes into a String.
+                    // Never use:
+                    // new String(buffer)
+                    // because old data may remain in unused
+                    // parts of the buffer.
+                    String chunk =
+                            new String(buffer, 0, bytesRead);
+
+                    // Split chunk on newline characters.
+                    // Example:
+                    // chunk:
+                    // "rld\nJava"
+                    // parts:
+                    // ["rld", "Java"]
+                    // The -1 tells Java to preserve trailing
+                    // empty strings.
+                    String[] parts = chunk.split("\n", -1);
+
+                    // Process every part EXCEPT the last.
+
+                    // Every part before the last ended with
+                    // a newline, therefore it represents a
+                    // complete line.
+                    // Example:
+                    // ["rld", "Java"]
+                    // "rld" completes a line.
+                    // "Java" may continue later.
+                    for (int i = 0; i < parts.length - 1; i++) {
+
+                        // Build complete line.
+                        // Example:
+                        // currentLine:
+                        // "Hello Wo"
+                        // parts[i]:
+                        // "rld"
+                        // result:
+                        // "Hello World"
+                        String completeLine = currentLine + parts[i];
+
+                        // Send line into queue.
+                        channel.put(completeLine);
+
+                        // Line is complete and sent.
+                        // Reset builder for next line.
+                        currentLine = "";
+                    }
+
+                    // Last part may be incomplete.
+                    // Save it for future reads
+                    // Example:
+                    // parts:
+                    // ["rld", "Java"]
+                    // currentLine becomes:
+                    // "Java"
+                    currentLine += parts[parts.length - 1];
+                }
+
+                // EOF reached.
+                // There may still be one unfinished line
+                // Example:
+                //
+                // File:
+                // Hello
+                // World
+                //
+                // If the file does not end with '\n',
+                // "World" will still be stored in currentLine.
+                if (!currentLine.isEmpty()) {
+
+                    // Send final line.
+                    channel.put(currentLine);
+                }
+
+            } catch (Exception e) {
+
+                // Print any unexpected errors.
+                e.printStackTrace();
+
+            } finally {
+
+                // Signal that no more lines are coming.
+                try {
+                    channel.put(EOF_MARKER);
+                } catch (InterruptedException ignored) {
+                }
+            }
+        });
+
+        // Start worker thread.
+        //
+        // Nothing inside the lambda executes until start()
+        // is called.
+        worker.start();
+
+        // Return immediately.
+        //
+        // The worker thread continues running in the background.
+        return channel;
     }
 }
